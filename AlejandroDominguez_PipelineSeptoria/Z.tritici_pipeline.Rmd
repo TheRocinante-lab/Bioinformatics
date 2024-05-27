@@ -1,0 +1,1914 @@
+---
+title: "Z.tritici Pipeline"
+author: "Alejandro Dominguez Rondon"
+date: "2024-02-22"
+title-block-banner: "#27445C"
+format: 
+  html:
+    embed-resources: true
+    logo: "https://raw.githubusercontent.com/TheRocinante-lab/ImagesPresentation/main/TheRocinanteLab.png"
+    smooth-scroll: true
+    theme: journal
+    fontcolor: black
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-location: left
+    toc-title: Introduction
+    toc-depth: 3
+    self-contained: true
+css: multitrait.css
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressWarnings(library(magick))
+library(cowplot)
+library(ggplot2)
+library(magick)
+library(reticulate)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(gridExtra)
+library(gtools)
+library(BEDMatrix)
+library(tidyverse)
+library(BGLR)
+library(rrBLUP)
+library(lme4)
+library("glmnet")
+library(factoextra)
+library(tidyverse)
+library(data.table)
+library(rrBLUP)
+require(tidyverse)
+library(pacman)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(gplots)
+
+source("http://zzlab.net/GAPIT/gapit_functions.txt")
+pacman::p_load(AssocTests)
+pacman::p_load("genetics")
+pacman::p_load("scatterplot3d")
+pacman::p_load(tidyverse)
+
+pacsBIO<-c("snpStats","rtracklayer","GenomicRanges","GenomInfoDb","IRanges")
+```
+
+# Introduction
+
+This pipeline is built to handle High Throughput Data of Zymoseptoria tritici. The goal is to create a reproducible workflow to perform Variant Calling in Whole Genome Sequencing data. 
+
+To do this, we will use real data from Zymoseptoria tritici. In the study, 119 samples were sent to paired-end WGS and 258 fastq files were obtained. This is due to the fact that a total of 9 samples were sequenced in two different lines in the flow cells, as we can see in Figure 1
+
+```{r, echo=FALSE, out.width = '100%',fig.align="center", warning=FALSE, fig.cap= "Figure1. Summary of Initial Data"}
+p1 <- ggdraw() + draw_image("/Users/alejandrodominguezrondon/Desktop/images/introduccion.png", scale = 0.9)
+p2 <- ggdraw() + draw_image("/Users/alejandrodominguezrondon/Desktop/images/tabla.png", scale = 0.9)
+
+plot_grid(p1, p2)
+```
+
+First, the data have to be preprocessed and the variants have to be called and
+filtered. Once the high quality variants are obtained they can be included in the correspondent analysis.
+
+The workflow proposed in here can be found below:
+
+```{r, echo=FALSE, out.width = '100%',fig.align="center", fig.cap= "Figure 2. Worflow proposed"}
+knitr::include_graphics("/Users/alejandrodominguezrondon/Desktop/images/Pipeline _new.png")
+```
+
+# Preprocessing
+## Quality Analysis
+
+Across the preprocessing steps we will be using the structure while read + list,
+to do so we will need a list with the samples. we just need to print the content
+of our folder containing the samples to a list. There are several ways to do this,
+for example:
+
+```{bash, eval = F}
+ls Data/fastq > Data/lists/samples.list
+ls Data/fastq/ | grep '_1' | sed 's/_1.fq.gz//' > Data/lists/basename.list
+ls Data/fastq/ | grep '_1' > Data/list/forward.list 
+cat Data/lists/forward.list | sed 's/.fq.gz//' > Data/lists/forward_names.list
+```
+
+We have created 4 different files:
+
+- samples.list: contains all the file names that we received from the sequencing
+analysis
+- basename.list: contains just the names of the samples without _1 or _2,
+which mean, just a name per forward and reverse file
+- forward.list: contains just the forward files names
+- forward_names: contains just the forward files names without the .fq.gz
+
+Now we can start the preprocessing stage using those files to iterate though the 
+samples.
+
+As a first step of the preprocessing, we conducted a quality analysis to get 
+to know some stats about our data. We used the tool FastQC and MultiQC to perform
+the analisys useing the following code:
+
+```{bash STP1_fastqc.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=QC_report
+#SBATCH --output=QC_report_%j.log
+#SBATCH --error=QC_report_%j.err
+#SBATCH --partition=medium
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=1-00:00:00
+#SBATCH --mem=126G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+max_jobs=16
+running_jobs=0
+fqlist="/home/arondon/GATK2/Data/lists/samples.list"
+
+#----------------------------------------------------------------------
+# Perform fastqc analysis
+#----------------------------------------------------------------------
+module load FastQC/0.11.8-Java-1.8
+module load Python
+pip install --user multiqc
+
+cd /home/arondon/GATK2/Data/fastq
+echo "Starting fastqc analysis"
+while read i; do
+        fastqc ${i} -t 2 -o /home/arondon/GATK2/Results/fastqc/ &
+        ((running_jobs++))
+        if [ $running_jobs -ge $max_jobs ];then
+                while [ $running_jobs -ge $max_jobs ]; do
+                        sleep 1
+                        running_jobs=$(jobs -p | wc -l)
+                done
+        fi
+done < ${fqlist}
+wait
+echo "Fastqc analysis finished"
+
+#----------------------------------------------------------------------
+# Perform multiqc analysis
+#----------------------------------------------------------------------
+
+echo "Starting multiqc analysis"
+cd /home/arondon/GATK2/Results/fastqc
+~/.local/bin/multiqc --outdir /home/arondon/GATK2/Results/multiqc/raw_multiqc ./
+echo "Multiqc analysis finihed\n"
+```
+
+Some result from the analysis can be found in Figure 3, 4 and 5. The whole report is multiqc/raw_multiqc.html
+
+```{r, echo=FALSE, out.width = '100%',fig.align="center", fig.cap= "Figure 3 Adapter Sequence Content"}
+knitr::include_graphics("/Users/alejandrodominguezrondon/Desktop/images/raw_adaptersequences.png")
+```
+```{r, echo=FALSE, out.width = '100%',fig.align="center", fig.cap= "Figure 4 Mean Quality Score"}
+knitr::include_graphics("/Users/alejandrodominguezrondon/Desktop/images/raw_meanQS.png")
+```
+```{r, echo=FALSE, out.width = '100%',fig.align="center", fig.cap= "Figure 5  Sequence Quality Scores"}
+knitr::include_graphics("/Users/alejandrodominguezrondon/Desktop/images/raw_sequenceQS.png")
+```
+
+We can see in Figure 3 how there are a significant amount of samples that present large presence of
+adapters sequences (also watch how some of the samples seems to have those sequences cut). 
+
+## Trimming
+
+Next thing to do then is to cut these adapters sequences. To do so we are going to use Trimmomatic with the parameters found in the code below: 
+
+```{bash STP2_trimming.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=trimming_QC
+#SBATCH --output=trimming_QC_%j.log
+#SBATCH --error=trimming_QC_%j.err
+#SBATCH --partition=medium
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=1-00:00:00
+#SBATCH --mem=126G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+files=1
+max_jobs=32
+running_jobs=0
+fqlist="/home/arondon/GATK2/Data/lists/forward.list"
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+
+module load Trimmomatic/0.38-Java-1.8
+
+#----------------------------------------------------------------------
+# Adapters trimming
+#----------------------------------------------------------------------
+cd $Data/fastq
+echo "Trimming adapters sequences..."
+mkdir -p $Results/trimmed/paired
+mkdir -p $Results/trimmed/unpaired
+while read i; do
+	reverse=$(echo $i | sed 's/_1.fq.gz/_2.fq.gz/')
+	bforward="$(basename ${i})"
+	breverse="$(basename ${reverse})"
+	num="$(echo ${i} | cut -d '_' -f 1)"
+
+	java -jar $EBROOTTRIMMOMATIC/trimmomatic-0.38.jar PE -phred33 -threads 4 \
+	$i \
+	$reverse \
+	$Results/trimmed/paired/${bforward} $Results/trimmed/unpaired/${bforward}_unpaired \
+	$Results/trimmed/paired/${breverse} $Results/trimmed/unpaired/${breverse}_unpaired \
+	ILLUMINACLIP:$EBROOTTRIMMOMATIC/adapters/TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36 & ((running_jobs++)) #It is recommended to take a look at the meaning of theese parameters before running these section of the code, just in case you might need more stringent parameters if the adapter content is larger.
+	
+	if [ $running_jobs -ge $max_jobs ];then #we will use this structure across all the pipeline to paralellize the jobs to reduce the computational time required
+		while [ $running_jobs -ge $max_jobs ]; do
+			sleep 1
+			running_jobs=$(jobs -p | wc -l)
+		done
+	fi
+
+done < $fqlist
+
+wait
+
+echo "Trimming process finished"
+
+#---------------------------------------------------------------------- 
+# If the files are created => quality analysis after trimming
+#----------------------------------------------------------------------
+if [ ${files} -eq 1 ]; then
+	module load FastQC/0.11.8-Java-1.8
+	module load Python
+	pip install --user multiqc
+	
+	cd $Results/trimmed/paired
+	echo "starting quality analysis after trimming..."
+	mkdir -p $Results/fastqc/processed
+	for i in ./*; do
+		fastqc ${i} -t 2 -o $Results/fastqc/processed &
+		if [ $running_jobs -ge $max_jobs ];then
+			while [ $running_jobs -ge $max_jobs ]; do
+				sleep 1
+				running_jobs=$(jobs -p | wc -l)
+			done
+		fi
+	done
+	wait
+
+	cd $Results/fastqc/processed
+	mkdir -p $Results/multiqc/processed
+	~/.local/bin/multiqc --outdir $Results/multiqc/processed ./
+	echo "Quality analysis finished\n"
+else
+	echo "The paired files were not correctly created"
+fi 
+
+```
+
+Pay attention to the size of your data in order to avoid having to rerun the quality analysis, since this particular code used 100% od the memmory required.
+
+Also note that the parameters used for the trimming should also be adapted to 
+the data. In our case, those ones were enough to reduce the proportion of 
+adapter sequence below the threshold of 0.1%. Some other scenarios would require 
+more stringent parameters and also maybe different adapter sequence reference 
+(we used the universal Illumina adapter TruSeq3-PE.fa)
+
+## Alignment
+
+The next step is to align the reads to the reference genome. The reference genome 
+fr Zymoseptoria tritici IPO323 has been downloaded from the NCBI curated 
+genome depository (https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000219625.1/)
+in fasta format. 
+
+Be aware that the ploidy of the organism is noted there, that information will be 
+useful in the upcoming sections of the pipeline.
+
+From that reference file we have also created the indexed reference as well as
+a dictionary, using samtools and gatk tools (CreateSequenceDictionary) respectively.
+These files must be together and can be found in GATK2/Data/ref. Finally the alignment
+will be performed using the BWA mem command. 
+
+```{bash STP3_alignment.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=alignment
+#SBATCH --output=alignment_%j.log
+#SBATCH --error=alignment_%j.err
+#SBATCH --partition=long
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=3-00:00:00
+#SBATCH --mem=120G
+
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+ref="/home/arondon/GATK2/Data/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna" 
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+list="${Data}/lists/basename.list"
+forward_list="${Data}/lists/forward_names.list"
+MAX_JOBS=16
+running_jobs=0
+
+
+module load BWA/0.7.17-GCC-8.2.0-2.31.1
+module load SAMtools/1.16.1-GCC-11.3.0
+module load Java/1.8.0_212
+module load picard/2.26.10-Java-15
+
+#----------------------------------------------------------------------
+# Align the samples to the reference genome
+#----------------------------------------------------------------------
+echo "Alignment in proccess..."
+cd $Results/trimmed/paired
+while read i; do
+	forward=$i
+	reverse="$(echo $i | sed 's/_1/_2/')"
+	base=${i/_1/}
+	RG="@RG\tID:${base}\tLB:${base}\tPL:Illumina\tSM:${base}"
+		
+	bwa mem -K 100000000 -v3 -t 1 \
+	-R $RG \
+	$ref \
+	${forward}.fq.gz \
+	${reverse}.fq.gz > $Results/aligned/sam/${base}.sam &
+	((running_jobs++))
+
+	if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+        	while [ $running_jobs -ge $MAX_JOBS ]; do
+            		sleep 1
+            		running_jobs=$(jobs -p | wc -l)
+        	done
+    	fi
+    echo "Alignment of $forward and $reverse finished" #Review this section as it runs inmedtiately because of parallelization 
+
+done < $forward_list
+
+wait
+
+echo "Alignment completed"
+```
+
+
+## Mark Duplicates
+
+Once the alignment is completed you can check using "samtools flagstat" how 
+there are 0 reads marked as duplicated. In order to fix that, we will run 
+MarkDuplicateSpark from GATK, which is also capable of converting the sam files
+to bam, indexed bam (bai) and sorted indexed bam (sbi) files. 
+
+```{bash STP4_markduplicates.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=markdedup
+#SBATCH --output=markdedup_%j.log
+#SBATCH --error=markdedup_%j.err
+#SBATCH --partition=long
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=5-00:00:00
+#SBATCH --mem=80G
+
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+MAX_JOBS=16
+running_jobs=0
+Data="/home/arondon/GATK2/Data"
+list="${Data}/lists/basename.list"
+Results="/home/arondon/GATK2/Results"
+ref="${Data}/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna"
+
+module load Python
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8
+module load Java/1.8.0_212
+module load SAMtools/1.9-GCC-8.2.0-2.31.1
+
+#----------------------------------------------------------------------
+# Mark Duplicates, create, sort and index bam files
+#----------------------------------------------------------------------
+
+echo "Marking the duplicated reads..."
+
+mkdir -p $Results/aligned/bam/metrics2
+mkdir -p $Results/aligned/dedup_bam2
+cd $Results/aligned/sam
+
+while read i; do
+gatk MarkDuplicatesSpark \
+	-I ${i}.sam \
+	-O $Results/aligned/dedup_bam2/${i}_dedup.bam \
+	-M $Results/aligned/bam/metrics2/${i}_metrics.txt\
+	
+smtools index $Results/aligned/dedup_bam2/${i}_dedup.bam
+done < $list
+
+echo "Process finished"
+```
+
+## Collect Metrics 
+
+In this script we will collect information about the insert size and about
+the alignment using CollectInsertSizeMetrics and CollectAlignmentSummaryMetrics, 
+and performing a multiqc analysis on the resulting files.
+
+```{bash STP5_metrics.slurm, eval = F}
+#!/bin/bash
+#SBATCH --job-name=metrics
+#SBATCH --output=metrics_%j.log
+#SBATCH --error=metrics_%j.err
+#SBATCH --partition=medium
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=1-00:00:00
+#SBATCH --mem=120G
+
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+MAX_JOBS=16
+running_jobs=0
+Data="/home/arondon/GATK2/Data"
+list="${Data}/lists/basename.list"
+Results="/home/arondon/GATK2/Results"
+ref="${Data}/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna"
+
+module load Python
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8
+module load Java/1.8.0_212
+module load SAMtools/1.9-GCC-8.2.0-2.31.1
+
+#----------------------------------------------------------------------
+# Collect metrics using CollectAlignmentSummaryMetrics and CollectInsertSizeMetrics
+#----------------------------------------------------------------------
+
+echo "Collecting Metrics..."
+
+cd $Results/aligned/dedup_bam2
+mkdir -p $Results/metrics
+while read i; do
+        gatk CollectAlignmentSummaryMetrics \
+        -R $ref \
+        -I ${i}_dedup.bam \
+        -O $Results/metrics/${i}_alignment_metrics.txt
+        
+        gatk CollectInsertSizeMetrics \
+        -I ${i}_dedup.bam \
+        -O $Results/metrics/${i}_size_metrics.txt \
+        -H $Results/metrics/${i}_histogram.pdf
+        
+        samtools depth -a ${i}_dedup.bam > $Results/metrics/${i}_depth_metrics.txt &
+        ((running_jobs++))
+        if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+                while [ $running_jobs -ge $MAX_JOBS ]; do
+                        sleep 1
+                        running_jobs=$(jobs -p | wc -l)
+                done
+        fi
+done < $list
+wait
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Quality analysis after tagging the duplicates
+#----------------------------------------------------------------------
+
+echo "Performing multiqc analysis..."
+
+cd $Results/metrics
+~/.local/bin/multiqc --outdir $Results/multiqc/metrics ./
+
+echo "Process finished"
+
+```
+
+## Base Quality Score Recalibration
+
+This is the last step of the preprocessing section of the pipeline. First, 
+to be able to recalibrate the bases we need to create a known sites file for the
+algorithm to learn the correlation between the quality score of the bases and the
+variants. We will build this file by creating a hard filtered dataset of variants
+using the HaplotypeCaller, SelectVariants and VariantFiltration from GATK.
+
+First we will call the variants and create 2 separated files for snps and indels,
+then we will filter the variants using hard filtering to create the known site
+files for snps and indels. 
+
+```{bash STP6_bqsr1.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=bqsr1
+#SBATCH --output=bqsr1_%j.log
+#SBATCH --error=bqsr1_%j.err
+#SBATCH --partition=medium
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=20
+#SBATCH --time=1-00:00:00
+#SBATCH --mem=100G
+
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+ref="/home/arondon/GATK2/Data/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna" 
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+list="${Data}/lists/basename.list"
+
+MAX_JOBS=30
+running_jobs=0
+
+
+module load R/4.2.0-foss-2021b
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8
+module load Java/1.8.0_212
+
+#----------------------------------------------------------------------
+# Known sites files creation for bqsr
+#----------------------------------------------------------------------
+echo "creating known sites files..."
+
+cd $Results/aligned/dedup_bam2
+#mkdir -p $Results/bqsr
+while read i; do
+    # Verificar si ninguno de los archivos existe
+    if [ ! -f "$Results/bqsr/${i}_known_snps.vcf" ] || [ ! -f "$Results/bqsr/${i}_known_indels.vcf" ]; then
+        (
+            mkdir -p "$Results/bqsr"
+            
+            gatk HaplotypeCaller \
+            -R "$ref" \
+            -I "${i}_dedup.bam" \
+            -O "$Results/bqsr/${i}_raw_variants.vcf" \
+            -ploidy 1 --max-alternate-alleles 2
+
+            gatk SelectVariants \
+            -R "$ref" \
+            -V "$Results/bqsr/${i}_raw_variants.vcf" \
+            -select-type SNP \
+            -O "$Results/bqsr/${i}_raw_snps.vcf"
+
+            gatk SelectVariants \
+            -R "$ref" \
+            -V "$Results/bqsr/${i}_raw_variants.vcf" \
+            -select-type INDEL \
+            -O "$Results/bqsr/${i}_raw_indels.vcf"
+
+            gatk VariantFiltration \
+            -R "$ref" \
+            -V "$Results/bqsr/${i}_raw_snps.vcf" \
+            -O "$Results/bqsr/${i}_valid_snps.vcf" \
+            -filter-name "QD_filter" -filter "QD < 2.0" \
+            -filter-name "FS_filter" -filter "FS > 60.0" \
+            -filter-name "MQ_filter" -filter "MQ < 40.0" \
+            -filter-name "SOR_filter" -filter "SOR > 4.0" \
+            -filter-name "MQRankSum_filter" -filter "MQRankSum < -12.5" \
+            -filter-name "ReadPosRankSum_filter" -filter "ReadPosRankSum < -8.0"
+
+            gatk VariantFiltration \
+            -R "$ref" \
+            -V "$Results/bqsr/${i}_raw_indels.vcf" \
+            -O "$Results/bqsr/${i}_valid_indels.vcf" \
+            -filter-name "QD_filter" -filter "QD < 2.0" \
+            -filter-name "FS_filter" -filter "FS > 200.0" \
+            -filter-name "SOR_filter" -filter "SOR > 10.0"
+
+            gatk SelectVariants \
+            --exclude-filtered \
+            -V "$Results/bqsr/${i}_valid_snps.vcf" \
+            -O "$Results/bqsr/${i}_known_snps.vcf"
+
+            gatk SelectVariants \
+            --exclude-filtered \
+            -V "$Results/bqsr/${i}_valid_indels.vcf" \
+            -O "$Results/bqsr/${i}_known_indels.vcf"
+        ) & ((running_jobs++))
+        if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+            while [ $running_jobs -ge $MAX_JOBS ]; do
+                sleep 1
+                running_jobs=$(jobs -p | wc -l)
+            done
+        fi
+    fi
+done < "$list"
+wait
+
+echo "Process finished"
+```
+
+Finally we will create the covariance table in order to apply the BQSR step, and
+we will also create the covariance table after the recalibration to see the 
+differences. 
+
+```{bash STP6_bqsr2.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=bqsr2
+#SBATCH --output=bqsr2_%j.log
+#SBATCH --error=bqsr2_%j.err
+#SBATCH --partition=medium
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=20
+#SBATCH --time=1-00:00:00
+#SBATCH --mem=128G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+ref="/home/arondon/GATK2/Data/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna" 
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+list="${Data}/lists/basename.list"
+
+MAX_JOBS=30
+running_jobs=0
+
+
+module load R/4.2.0-foss-2021b
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8
+module load Java/1.8.0_212
+
+#----------------------------------------------------------------------
+# Base QUality Score Recalibration
+#----------------------------------------------------------------------
+echo "Recalibrating base scores..."
+MAX_JOBS=25
+running_jobs=0
+
+mkdir -p $Results/bqsr2/pre_recal_tables
+mkdir -p $Results/bqsr2/recal_bam
+mkdir -p $Results/bqsr2/post_recal_tables
+mkdir -p $Results/bqsr2/plots
+
+cd Results/aligned/dedup_bam2
+while read i; do
+        (gatk BaseRecalibrator \
+        -R $ref \
+        -I ${i}_dedup.bam \
+        --known-sites $Results/bqsr/${i}_known_snps.vcf \
+        --known-sites $Results/bqsr/${i}_known_indels.vcf \
+        -O $Results/bqsr2/pre_recal_tables/${i}_pre.table
+        
+        gatk ApplyBQSR \
+        -R $ref \
+        -I ${i}_dedup.bam \
+        -bqsr $Results/bqsr2/pre_recal_tables/${i}_pre.table \
+        -O $Results/bqsr2/recal_bam/${i}_recal.bam
+        
+        gatk BaseRecalibrator \
+        -R $ref \
+        -I $Results/bqsr2/recal_bam/${i}_recal.bam \
+        --known-sites $Results/bqsr/${i}_known_snps.vcf \
+        --known-sites $Results/bqsr/${i}_known_indels.vcf \
+        -O $Results/bqsr2/post_recal_tables/${i}_post.table
+        
+        gatk AnalyzeCovariates \
+        -before $Results/bqsr2/pre_recal_tables/${i}_pre.table \
+        -after $Results/bqsr2/post_recal_tables/${i}_post.table \
+        -plots $Results/bqsr2/plots/${i}_plots.pdf) &
+        ((running_jobs++))
+        if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+                while [ $running_jobs -ge $MAX_JOBS ]; do
+                        sleep 1  
+                        running_jobs=$(jobs -p | wc -l) 
+                done
+        fi
+done < $list
+wait 
+
+echo "Process finished"
+
+```
+
+As we mentionned before, we have 9 samples (specifically S3, S6, S7, S12, S29, S20, S23, S42 and S57)
+which has been sequenced in two different flow cell lines. Once have preprocessed them
+we are going to merge them using the following code:
+
+```{bash STP7_mergebam.slurm, eval = FALSE}
+#!/bin/bash
+#SBATCH --job-name=mergebam
+#SBATCH --output=mergebam_%j.log
+#SBATCH --error=mergebam_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=15
+#SBATCH --time=2:00:00
+#SBATCH --mem=60G
+
+module load SAMtools/1.9-GCC-8.2.0-2.31.1
+module load picard/2.26.10-Java-15
+
+mkdir -p /home/arondon/GATK2/Analysis/tomerge
+mkdir -p /home/arondon/GATK2/Analysis/tomerge
+
+cd Results/bqsr2/recal_bam/ 
+mv S3_EKDN220047190-1A_HMTG3DSX5_L1_recal.bai S3_EKDN220047190-1A_HMTG3DSX5_L1_recal.bam S3_EKDN220047190-1A_HMTGCDSX5_L3_recal.bai S3_EKDN220047190-1A_HMTGCDSX5_L3_recal.bam S6_EKDN220047193-1A_HMTG3DSX5_L1_recal.bai S6_EKDN220047193-1A_HMTG3DSX5_L1_recal.bam S6_EKDN220047193-1A_HMTGCDSX5_L3_recal.bai S6_EKDN220047193-1A_HMTGCDSX5_L3_recal.bam S12_EKDN220047199-1A_HMTG3DSX5_L1_recal.bai S12_EKDN220047199-1A_HMTG3DSX5_L1_recal.bam S12_EKDN220047199-1A_HMTGCDSX5_L3_recal.bai S12_EKDN220047199-1A_HMTGCDSX5_L3_recal.bam S19_EKDN220047206-1A_HMTG3DSX5_L1_recal.bai S19_EKDN220047206-1A_HMTG3DSX5_L1_recal.bam S19_EKDN220047206-1A_HMTGCDSX5_L3_recal.bai S19_EKDN220047206-1A_HMTGCDSX5_L3_recal.bam S20_EKDN220047207-1A_HMTG3DSX5_L1_recal.bai S20_EKDN220047207-1A_HMTG3DSX5_L1_recal.bam S20_EKDN220047207-1A_HMTGCDSX5_L3_recal.bai S20_EKDN220047207-1A_HMTGCDSX5_L3_recal.bam S23_EKDN220047210-1A_HMTG3DSX5_L1_recal.bai S23_EKDN220047210-1A_HMTG3DSX5_L1_recal.bam S23_EKDN220047210-1A_HMTGCDSX5_L3_recal.bai S23_EKDN220047210-1A_HMTGCDSX5_L3_recal.bam S42_EKDN220047229-1A_HMTG3DSX5_L1_recal.bai S42_EKDN220047229-1A_HMTG3DSX5_L1_recal.bam S42_EKDN220047229-1A_HMTGCDSX5_L3_recal.bai S42_EKDN220047229-1A_HMTGCDSX5_L3_recal.bam S57_EKDN220047244-1A_HMTG3DSX5_L1_recal.bai S57_EKDN220047244-1A_HMTG3DSX5_L1_recal.bam S57_EKDN220047244-1A_HMTGCDSX5_L3_recal.bai S57_EKDN220047244-1A_HMTGCDSX5_L3_recal.bam S7_EKDN220047194-1A_HMTG3DSX5_L1_recal.bai S7_EKDN220047194-1A_HMTG3DSX5_L1_recal.bam S7_EKDN220047194-1A_HMTGCDSX5_L3_recal.bai S7_EKDN220047194-1A_HMTGCDSX5_L3_recal.bam
+/home/arondon/GATK2/Analysis/tomerge
+
+cd /home/arondon/GATK2
+
+Analysis="/home/arondon/GATK2/Analysis"
+cd $Analysis/duplicated_samples/tomerge
+
+samples=(
+    "S12_EKDN220047199-1A_HMTG3DSX5_L1_recal.bam:S12_EKDN220047199-1A_HMTGCDSX5_L3_recal.bam"
+    "S20_EKDN220047207-1A_HMTGCDSX5_L3_recal.bam:S20_EKDN220047207-1A_HMTG3DSX5_L1_recal.bam"
+    "S42_EKDN220047229-1A_HMTG3DSX5_L1_recal.bam:S42_EKDN220047229-1A_HMTGCDSX5_L3_recal.bam"
+    "S6_EKDN220047193-1A_HMTGCDSX5_L3_recal.bam:S6_EKDN220047193-1A_HMTG3DSX5_L1_recal.bam"
+    "S23_EKDN220047210-1A_HMTG3DSX5_L1_recal.bam:S23_EKDN220047210-1A_HMTGCDSX5_L3_recal.bam"
+    "S57_EKDN220047244-1A_HMTG3DSX5_L1_recal.bam:S57_EKDN220047244-1A_HMTGCDSX5_L3_recal.bam"
+    "S19_EKDN220047206-1A_HMTG3DSX5_L1_recal.bam:S19_EKDN220047206-1A_HMTGCDSX5_L3_recal.bam"
+    "S3_EKDN220047190-1A_HMTG3DSX5_L1_recal.bam:S3_EKDN220047190-1A_HMTGCDSX5_L3_recal.bam"
+    "S7_EKDN220047194-1A_HMTGCDSX5_L3_recal.bam:S7_EKDN220047194-1A_HMTG3DSX5_L1_recal.bam"
+)
+
+for pair in "${samples[@]}"; do
+    (IFS=':' read -r sample1 sample2 <<< "$pair"
+    
+    newname=$(echo ${sample1} | cut -d '_' -f 1-3)
+    output=${newname}_merge_recal.bam
+    output_RG=${newname}_merge_adjustedRG_recal.bam
+    
+    echo "Merging ${sample1} and ${sample2} into ${output}"
+    
+    samtools merge $Analysis/duplicated_samples/merged/${output} ${sample1} ${sample2}
+    
+    java -jar $EBROOTPICARD/picard.jar AddOrReplaceReadGroups \
+    I=${Analysis}/duplicated_samples/merged/${output} \
+    O=${Analysis}/duplicated_samples/merged/${output_RG} \
+    RGID=${newname} \
+    RGLB=${newname} \
+    RGPL=illumina \
+    RGPU=unit1 \
+    RGSM=${newname}
+    
+    samtools index ${Analysis}/duplicated_samples/merged/${output_RG}) &
+done
+
+wait
+
+cp ${Analysis}/duplicated_samples/merged/* Results/bqsr2/recal_bam/ 
+
+printf "Process finished"
+```
+
+As the names of the file in Results/bqsr2/recal_bam/ have changed, we should create a 
+new list to iterate through the file.
+
+```{bash, eval = FALSE}
+ls Results/bqsr2/recal_bam/ | grep '.bam$' | sed 's/_recal.bam//' > Data/lists/vc.list
+```
+
+# Variant Calling and Filtering
+
+## Variant Calling
+
+We will proceed now with the variant calling step. We will use the HaplotypeCaller
+from GATK to generate vcf files per samples (using the -ERC GVCF option).
+```{bash STP8_variantcalling.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=vc
+#SBATCH --output=vc_%j.log
+#SBATCH --error=vc_%j.err
+#SBATCH --partition=medium
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=1-00:00:00
+#SBATCH --mem=128G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+ref="/home/arondon/GATK2/Data/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna" 
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+list="${Data}/lists/vc.list"
+
+MAX_JOBS=30
+running_jobs=0
+
+
+module load R/4.2.0-foss-2021b
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8
+module load Java/1.8.0_212
+
+#----------------------------------------------------------------------
+# Variant Calling
+#----------------------------------------------------------------------
+
+echo "Starting Variant Calling"
+
+mkdir -p $Results/variant_calling/gvcf
+cd $Results/bqsr2/recal_bam
+while read i; do
+    if [ ! -f "$Results/variant_calling/gvcf/${i}.g.vcf.gz.tbi" ]; then
+        (
+        gatk HaplotypeCaller \
+        -R $ref \
+        -I ${i}_recal.bam \
+        -O $Results/variant_calling/gvcf/${i}.g.vcf.gz \
+        -ploidy 1 \
+        --max-alternate-alleles 2 \
+        -ERC GVCF
+        ) &
+        ((running_jobs++))
+        if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+            while [ $running_jobs -ge $MAX_JOBS ]; do
+                sleep 1  # wait for 1 second before checking again
+                running_jobs=$(jobs -p | wc -l)  # update the count of running jobs
+            done
+        fi
+    fi
+done < $list
+wait 
+
+echo "Variant Calling Finished"
+```
+
+## Database Creation and GFCV Files Consolidation
+
+We have to build nowthe Genomic db that will help increase the efficiency 
+and the speed when consolidating the per sample vcfs in just
+one file. 
+
+To do so we will need a sample hapmap file, which a tab-delimited text
+file with sample_name--tab--path_to_sample_vcf per line. Using a sample map saves 
+the tool from having to download the GVCF headers in order to determine the sample 
+names. Sample names in the sample name map file may have non-tab whitespace,
+but may not begin or end with whitespace (https://gatk.broadinstitute.org/hc/en-us/articles/360036883491-GenomicsDBImport).
+
+But also an interval list, which is a genomic region associated with certain
+annotation, in this case to chromosomes. 
+
+The genomic table will be used at the end to create the file 'raw_joint.vcf' file,
+containing all the raw snps and indels fro the 128 samples in just one vcf.
+
+```{bash STP9_dbimport.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=dbimport
+#SBATCH --output=dbimport_%j.log
+#SBATCH --error=dbimport_%j.err
+#SBATCH --partition=long
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=15
+#SBATCH --time=3-00:00:00
+#SBATCH --mem=100G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+ref="/home/arondon/GATK2/Data/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna" 
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+list="${Data}/lists/vc.list"
+ref_fai="${ref}.fai"
+
+
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8 
+module load Python
+
+#----------------------------------------------------------------------
+# Create the sample map file
+#----------------------------------------------------------------------
+echo "Creating map file..."
+while read line; do
+        result=$(printf "${line}\t${Results}/variant_calling/gvcf/${line}.g.vcf.gz")
+        printf "${result}\n" >>  ${Data}/lists/zymoseptoria.sample_map 
+done < $list
+wait 
+
+mapfile=$(echo -e ${Data}/lists/zymoseptoria.sample_map | sed '/^$/d')
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Create the interval list with the position of the chromosomes
+#----------------------------------------------------------------------
+echo "Creating interval list..."
+
+awk '{print $1 FS "1" FS $2}' "$ref_fai" > $Data/lists/interval.list
+interval_list="${Data}/lists/interval.list"
+awk '{print $1 ":" $2 "-" $3}' $interval_list > $Data/lists/new_interval.list
+ilist="${Data}/lists/new_interval.list"
+
+#----------------------------------------------------------------------
+# Consolidate the contents of GVCF files of each sample
+#----------------------------------------------------------------------
+
+echo "Creating db..."
+
+gatk GenomicsDBImport \
+--genomicsdb-workspace-path $Results/genomicdb \
+--sample-name-map $mapfile \
+--reader-threads $SLURM_CPUS_PER_TASK \
+-L $ilist
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Create the raw joint vcf file
+#----------------------------------------------------------------------
+
+echo "Creating joint vcf..."
+
+gatk GenotypeGVCFs \
+-R $ref \
+-V gendb://$Results/genomicdb \
+-O ${Results}/variant_calling/raw_joint.vcf \
+-L $ilist
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Split the SNPs and the Indes in two different files
+#----------------------------------------------------------------------
+
+echo "Creating raw snp file..."
+
+gatk SelectVariants \
+-R ${ref} \
+-V ${Results}/variant_calling/raw_joint_new.vcf \
+--select-type-to-include SNP \
+-O $Results/variant_calling/snps/raw_snps.vcf
+
+echo "Creating raw indel file..."
+
+ gatk SelectVariants \
+-R ${ref} \
+-V ${Results}/variant_calling/raw_joint_new.vcf \
+--select-type-to-include INDEL \
+-O $$Results/variant_calling/indels/raw_indels.vcf
+
+echo "Process finished"
+```
+
+## Annotation Table Creation 
+
+We will use the VariantsToTable tool from GATK to extract specific fields for
+each variant to a tab separated table. Then we will use ggplot2 package in R to 
+create density plot for each annotation to select our hard filtering parameters.
+But first, two separated vcf files have to be created for snps and indels, given
+that the distribution of the annotation is different for each variant type.
+
+```{bash STP10_annotationtable.slurm, eval= F}
+#!/bin/bash
+#SBATCH --job-name=anntable
+#SBATCH --output=anntable_%j.log
+#SBATCH --error=anntable_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mem=40G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+ref="/home/arondon/GATK2/Data/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna" 
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+list="${Data}/lists/samples_new.list"
+ref_fai="${ref}.fai"
+vcf="${Results}/variant_calling/raw_joint_new.vcf"
+
+
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8 
+module load Python
+
+#----------------------------------------------------------------------
+# Extract the annotations to table format
+#----------------------------------------------------------------------
+
+echo "Creating the table for snps and indels..."
+
+mkdir -p $Results/tables
+gatk VariantsToTable \
+-V $Results/variant_calling/snps/raw_snps.vcf \
+-F QD -F FS -F SOR -F MQ -F MQRankSum -F ReadPosRankSum -F DP \
+-O $Results/tables/snps2.table 
+
+gatk VariantsToTable \
+-V $Results/variant_calling/indels/raw_indels.vcf \
+-F QD -F FS -F SOR -F MQ -F MQRankSum -F ReadPosRankSum -F DP \
+-O $Results/tables/indels2.table 
+
+
+echo "Process finished"
+```
+
+
+## Hard Filtering and Parameters Selection
+
+We have to download the table with the annotations that we built previously, and now then we will plot the following annotations
+
+```{r}
+rawsnps <- read.table("/Users/alejandrodominguezrondon/Downloads/snps2-1.table", header = T)
+```
+
+The 6 annotations known for being highly informative are:
+
+- Quality Depth: This is the variant confidence (from the QUAL field) divided by the unfiltered depth of non-hom-ref samples. This annotation is intended to normalize the variant quality in order to avoid inflation caused when there is deep coverage. For filtering purposes it is better to use QD than either QUAL or DP directly.
+
+- Fisher Strand: This is the Phred-scaled probability that there is strand bias at the site. Strand Bias tells us whether the alternate allele was seen more or less often on the forward or reverse strand than the reference allele. When there little to no strand bias at the site, the FS value will be close to 0.
+
+- Strand Odds Ratio: This is another way to estimate strand bias using a test similar to the symmetric odds ratio test. SOR was created because FS tends to penalize variants that occur at the ends of exons. Reads at the ends of exons tend to only be covered by reads in one direction and FS gives those variants a bad score. SOR will take into account the ratios of reads that cover both alleles.
+
+- RMSMapping Quality: This is the root mean square mapping quality over all the reads at the site. Instead of the average mapping quality of the site, this annotation gives the square root of the average of the squares of the mapping qualities at the site. It is meant to include the standard deviation of the mapping qualities. Including the standard deviation allows us to include the variation in the dataset.
+
+- Mapping Quality Rank Sum Test: This is the u-based z-approximation from the Rank Sum Test for mapping qualities. It compares the mapping qualities of the reads supporting the reference allele and the alternate allele. A positive value means the mapping qualities of the reads supporting the alternate allele are higher than those supporting the reference allele; a negative value indicates the mapping qualities of the reference allele are higher than those supporting the alternate allele. A value close to zero is best and indicates little difference between the mapping qualities.
+
+- Read Pos Rank Sum Test: The last annotation we will look at is ReadPosRankSum. This is the u-based z-approximation from the Rank Sum Test for site position within reads. It compares whether the positions of the reference and alternate alleles are different within the reads. Seeing an allele only near the ends of reads is indicative of error, because that is where sequencers tend to make the most errors. A negative value indicates that the alternate allele is found at the ends of reads more often than the reference allele; a positive value indicates that the reference allele is found at the ends of reads more often than the alternate allele. A value close to zero is best because it indicates there is little difference between the positions of the reference and alternate alleles in the reads.
+
+- Combined graphs
+```{r, fig.width=8, fig.height=10, echo=FALSE}
+
+QD <- ggplot(rawsnps, aes(x = QD)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  geom_vline(xintercept=2, color = "red", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=20, color = "skyblue", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=22, color = "black", linetype= "dashed", show.legend = T) +
+  ggtitle("Quality by Depth Density")
+
+
+FS <- ggplot(rawsnps, aes(x = FS)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  geom_vline(xintercept=60, color = "red", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=10, color = "skyblue", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=6, color = "black", linetype= "dashed", show.legend = T) +
+  scale_x_log10() +
+  ggtitle("FIsher Strand Density")
+
+
+SOR <- ggplot(rawsnps, aes(x = SOR)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  geom_vline(xintercept=3, color = "red", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=1.5, color = "black", linetype= "dashed", show.legend = T) +
+  scale_x_continuous(limits = c(0, 10)) + 
+  ggtitle("Strand Odds Ratio Density")
+
+MQ <- ggplot(rawsnps, aes(x = MQ)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  scale_x_continuous(limits = c(20, 70)) + 
+  geom_vline(xintercept=40, color = "red", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=20, color = "skyblue", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=50, color = "black", linetype= "dashed", show.legend = T) +
+  ggtitle("Mapping Quality")
+
+MQRankSum <- ggplot(rawsnps, aes(x = MQRankSum)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  scale_x_continuous(limits = c(-15, 5)) + 
+  geom_vline(xintercept=-12.5, color = "red", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=2, color = "skyblue", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=-2, color = "skyblue", linetype= "dashed", show.legend = T) + 
+  ggtitle("Mapping Quality Rank Sum")
+
+RPRS <- ggplot(rawsnps, aes(x = ReadPosRankSum)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  scale_x_continuous(limits = c(-10, 4)) + 
+  geom_vline(xintercept=-8, color = "red", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=2, color = "skyblue", linetype= "dashed", show.legend = T) +
+  geom_vline(xintercept=-2, color = "skyblue", linetype= "dashed", show.legend = T) + 
+  ggtitle("Read Position Rank Sum Test")
+grid.arrange(QD, FS, SOR, MQ, MQRankSum, RPRS, nrow= 3, ncol = 2)
+```
+We have selected the following thresholds, corresponding to the black dashed lines in the plots:
+
+- QD < 22.0
+- FS > 6.0
+- SOR > 1.5
+- MQ < 50.0
+- MQRankSum > 2.0
+- MQRankSum < -2.0
+- ReadPosRankSum > 2.0 
+- ReadPosRankSum < -2.0
+
+We can now apply those filters to our raw snp file
+
+```{bash STP11_hardfiltering.slurm, eval = F}
+#!/bin/bash
+#SBATCH --job-name=hardfiltering
+#SBATCH --output=hardfiltering_%j.log
+#SBATCH --error=hardfiltering_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=20
+#SBATCH --time=02:00:00
+#SBATCH --mem=40G
+
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+ref="/home/arondon/GATK2/Data/ref/GCF_000219625.1_MYCGR_v2.0_genomic.fna" 
+Data="/home/arondon/GATK2/Data"
+Results="/home/arondon/GATK2/Results"
+list="${Data}/lists/basename.list"
+ref_fai="${ref}.fai"
+MAX_JOBS=15
+running_jobs=0
+
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8 
+module load Python
+
+#----------------------------------------------------------------------
+# Filter the snps and the indels
+#----------------------------------------------------------------------
+
+echo "Filtering snps and indels..."
+
+gatk VariantFiltration \
+-R $ref \
+-V $Results/variant_calling/snps/raw_snps.vcf \
+-O $Results/variant_calling/snps/hf_snps_filter.vcf \
+-filter "QD < 22.0" -filter-name "QD_filter" \
+-filter "FS > 6.0" -filter-name "FS_filter" \
+-filter "SOR > 1.5" -filter-name "SOR_filter" \
+-filter "MQ < 50.0" -filter-name "MQ_filter" \
+-filter "MQRankSum > 2.0" -filter-name "MQRankSum_filterH" \
+-filter "MQRankSum < -2.0"  -filter-name "MQRankSum_filterL" \
+-filter "ReadPosRankSum > 2.0" -filter-name "ReadPosRankSumH" \
+-filter "ReadPosRankSum < -2.0" -filter-name "ReadPosRankSumL" 
+
+gatk VariantFiltration \
+-R $ref \
+-V $Results/variant_calling/indels/raw_indels.vcf \
+-O $Results/variant_calling/indels/hf_indels_filter.vcf \
+-filter "QD < 25.0" -filter-name "QD_filter"  \
+-filter "FS > 7.0" -filter-name "FS_filter" \
+-filter "SOR > 1.5" -filter-name "SOR_filter"  & ((running_jobs++))
+if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+    while [ $running_jobs -ge $MAX_JOBS ]; do
+        sleep 1
+        running_jobs=$(jobs -p | wc -l)
+    done
+fi
+
+wait
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Select the snps and the indels that passed filter
+#----------------------------------------------------------------------
+
+echo "Filtering snps and indels..."
+
+MAX_JOBS=2
+running_jobs=0
+
+gatk SelectVariants \
+--exclude-filtered \
+--remove-unused-alternates \
+-V $Results/variant_calling/snps/hf_snps_filter.vcf \
+-O $Results/variant_calling/snps/f1_snps.vcf 
+
+gatk SelectVariants \
+--exclude-filtered \
+--remove-unused-alternates \
+-V $Results/variant_calling/indels/hf_indels_filter.vcf \
+-O $Results/variant_calling/indels/f1_indels.vcf & ((running_jobs++))
+if [ "$running_jobs" -ge "$MAX_JOBS" ]; then
+    while [ $running_jobs -ge $MAX_JOBS ]; do
+        sleep 1  # wait for 1 second before checking again
+        running_jobs=$(jobs -p | wc -l)  # update the count of running jobs
+    done
+fi
+
+wait 
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Create the annotation tables for the genotype annotations DP and GQ
+#----------------------------------------------------------------------
+
+echo "Starting to create the DP and GQ annotation table..."
+
+for i in DP GQ; do
+    gatk VariantsToTable \
+    -V Results/variant_calling/snps/f1_snps.vcf \
+    -GF ${i} \
+    -O Results/tables/geno_${i}_snps.table
+done 
+
+echo "Process finished"
+```
+
+We can now plot the differences in the distriution before and after filtering:
+
+```{r, fig.height=20, fig.width=10}
+filteredsnps <- read.table("~/Desktop/files_RMD/snps_after_filtering.table", header = T)
+
+QD2 <- ggplot(filteredsnps, aes(x = QD)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  ggtitle("Quality by Depth Density")
+
+FS2 <- ggplot(filteredsnps, aes(x = FS)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  scale_x_log10() +
+  ggtitle("FIsher Strand Density")
+
+SOR2 <- ggplot(filteredsnps, aes(x = SOR)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  ggtitle("Strand Odds Ratio Density")
+
+MQ2 <- ggplot(filteredsnps, aes(x = MQ)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  scale_x_continuous(limits = c(20, 70)) + 
+  ggtitle("Mapping Quality")
+
+MQRankSum2 <- ggplot(filteredsnps, aes(x = MQRankSum)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  scale_x_continuous(limits = c(-15, 5)) + 
+  ggtitle("Mapping Quality Rank Sum")
+
+RPRS2 <- ggplot(filteredsnps, aes(x = ReadPosRankSum)) +
+  geom_density(fill = "skyblue", alpha = 0.5) +
+  scale_x_continuous(limits = c(-10, 4)) + 
+  ggtitle("Read Position Rank Sum Test")
+
+grid.arrange(QD, QD2, FS, FS2, SOR, SOR2, MQ, MQ2, MQRankSum, MQRankSum2, RPRS, RPRS2, ncol = 2, top = textGrob("Density distribution of sekected annotations before and after hard-filtering\n",gp=gpar(fontsize=20,font=3)))
+```
+
+Once we have hard filtered them, we will evaluate the minor alelle frequency and 
+the missing rate per variant using the following code.
+
+```{bash STP11_split_maf.slurm, eval = F}
+#!/bin/bash
+#SBATCH --job-name=mafmissing
+#SBATCH --output=mafmissing_%j.log
+#SBATCH --error=mafmissing_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
+#SBATCH --time=02:00:00
+#SBATCH --mem=40G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+Results="/home/arondon/GATK2/Results"
+input="${Results}/variant_calling/snps/f1_snps.vcf"
+output_table="${Results}/tables/variants_counter.table"
+output_bsnps="${Results}/variant_calling/snps/f1_bialellic_snps.vcf"
+output_tsnps="${Results}/variant_calling/snps/f1_trialellic_snps.vcf"
+output_indels="${Results}/variant_calling/snps/f1_indels.vcf"
+
+module load Python
+module load VCFtools/0.1.16-GCC-10.2.0
+
+#----------------------------------------------------------------------
+# Filter based on the DP and GQ annotations
+#----------------------------------------------------------------------
+
+echo "Starting to split the variants..."
+
+python Scripts/variants_counter.py \
+-i $input \
+-o $output_table \
+-split \
+--bisnps $output_bsnps \
+--multisnps $output_tsnps \
+--indels $output_indels
+
+echo "Process finished"
+
+
+#----------------------------------------------------------------------
+# Generating the minor alelle ballance table
+#----------------------------------------------------------------------
+
+echo "Starting to generate the frequency table..."
+
+vcftools \
+--vcf $output_bsnps \
+--freq \
+--out Results/tables/frequencies
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Generating the minor alelle ballance table
+#----------------------------------------------------------------------
+
+missing_table="${Results}/tables/f1_bialellic"
+
+vcftools --vcf $output_bsnps --missing-site --out ${missing_table}
+```
+
+The script variant_counter.py is a custom script which classifies the variants like this:
+
+```{python variant_counter.py, eval = FALSE}
+import argparse
+import pandas as pd
+
+print("Calculating the different variants...")
+parser = argparse.ArgumentParser(description='Count the number of biallellic and multiallelic snps', formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument('-i', '--input', type=str, help='Input vcf file')
+parser.add_argument('-o', '--outputtable', type=str, help='Path to the output table')
+parser.add_argument('-split', action="store_true", help='If true, three separated vcf files will be created, one for the biallelic snps and one for the multiallelic')
+parser.add_argument('--bisnps', type=str, help='Output for the filtered biallelic snps')
+parser.add_argument('--multisnps', type=str, help='Output for the filtered multiallelic snps')
+parser.add_argument('--indels', type=str, help='Output for the filtered indels')
+
+
+A = parser.parse_args()
+
+biallelic = 0
+multiallelic = 0
+indel = 0
+lines = 0
+
+# The following conditional follows the following structure: if -split option is present
+# then three separated files will be created (biallelic snps, multiallelic snps and indels).
+# If not, we will just calculate the number of each type of variants withouth extracting
+# the information about that variant and creating a file for each subtype.
+if A.split:
+    with open(A.input, "r") as vcf, open(A.bisnps, "w") as bi, open(A.multisnps, "w") as multi, open(A.indels, "w") as ind:
+        for line in vcf:
+            if line.startswith('##') or line.startswith('#CHROM'):
+                bi.write(line)
+                multi.write(line)
+                ind.write(line)
+            else:
+                cols = line.strip().split("\t")
+                ref = cols[3]
+                alt = cols[4]
+                if len(ref) > 1:
+                    indel += 1
+                    ind.write(line)
+                elif len(ref) == 1:
+                    if len(alt) == 1:
+                        biallelic += 1
+                        bi.write(line)
+                    elif len(alt) > 1 and "," not in alt:
+                        indel += 1
+                        ind.write(line)
+                    elif "," in alt:
+                        terms = alt.split(",")
+                        if all(len(term) == 1 for term in terms):
+                            multiallelic += 1
+                            multi.write(line)
+                        else:
+                            indel += 1
+                            ind.write(line)
+# These conditional might be a little bit confusing, so I have added a logic table
+# explaining the different outcomes based on the length of the values in the reference
+# and in the altertate
+else:
+    with open(A.input, "r") as vcf:
+        for line in vcf:
+            if not line.startswith("#"):
+                lines += 1
+                cols = line.strip().split("\t")
+                ref = cols[3]
+                alt = cols[4]
+                if len(ref) > 1:
+                    indel += 1
+                elif len(ref) == 1:
+                    if len(alt) == 1:
+                        biallelic += 1
+                    elif len(alt) > 1 and "," not in alt:
+                        indel += 1
+                    elif "," in alt:
+                        terms = alt.split(",")
+                        if all(len(term) == 1 for term in terms): # note that "term" refers to each one of the segments of terms
+                            multiallelic += 1
+                        else:
+                            indel += 1
+
+# We will also represent the result in a table, where we will include checks to verify
+# that all the lines have been read and that the sum of the values is equal to the total observations
+total = biallelic + multiallelic + indel 
+print(f"Results for file {A.input}")
+df = pd.DataFrame({'Indels': [indel], 'Biallelic SNPs': [biallelic], 'Multiallelic SNPs': [multiallelic], 'Total observed': [total], 'Lines counted': [lines]})
+
+# if the argument --outputtable/ -ot is present then the table will be redircted to a file, if not
+# the table will be shown in terminal
+if A.outputtable: 
+    with open(A.outputtable, "w") as table:
+        table.write(df.to_string(index=False))
+else:
+    print(df)
+
+print("Process finished")
+
+
+
+```
+
+To make it easier to understand look at the following figure:
+```{r, echo=FALSE, out.width = '100%',fig.align="center", fig.cap= "Figure X. Logic behind the variant_counter script"}
+knitr::include_graphics("/Users/alejandrodominguezrondon/Desktop/images/arbol_decision.png")
+```
+
+Here we can see the difference between the number of bialellic and multiallelic snps
+```{r}
+table_alellic <- read.csv2("~/Desktop/files_RMD/variants_counter.table", header = TRUE, sep = "")
+table_alellic <- table_alellic[,2:4]
+colnames(table_alellic) <- c("Bialellic", "Multialellic", "Total Observed")
+table_alellic
+```
+
+
+It is important to plot the missingness and the MAF distribution, as we did with the INFO annotations.
+So, we download the tables, makes a few adjustments and plot them.
+
+```{r}
+MAF <- read.table("~/Desktop/files_RMD/frequencies-2.frq", header = T, fill = T, row.names = NULL)
+#we then rename the columns
+colnames(MAF) <- c("CHR", "POS", "NALELLES", "NCHR", "MAF", "mAF")
+#The minor Alelle Frequency (mAF) column has a letter:number format so we have to split it in two
+MAF <- cbind(MAF, do.call(rbind, strsplit(as.character(MAF$MAF), ":")))
+# And we Rename the new columns
+colnames(MAF) <- c("CHR", "POS", "NALELLES", "NCHR", "MAF", "mAF_complete", "MAF_base", "MAF_value")
+#We have to convert the values to numeric
+MAF$MAF_value<- as.numeric(MAF$MAF_value)
+# In order to be able to round to the third decimal, in order to get a better representation of the density
+MAF$plot <- round(MAF$MAF_value, 3)
+MAF$mAF <- 1 - MAF$MAF_value
+```
+
+```{r}
+MAF_plot <- ggplot(MAF, aes(x = mAF)) +
+  geom_density(fill = "skyblue", alpha = 0.5) + 
+  scale_y_continuous(limits = c(0, NA)) +
+  geom_vline(xintercept=0.05, color = "black", linetype= "dashed", show.legend = T)+
+  xlim(0,0.25) +
+  ggtitle("Minor Alelle Frequency Density Distribution")+
+  xlab("Minor Alelle Frequency")
+MAF_plot
+```
+
+```{r}
+missingnes <- read.table("~/Desktop/files_RMD/f1_bialellic-1.imiss", header = T)
+ggplot()+
+  geom_density(data=missingnes, aes(x=F_MISS), fill = "skyblue", alpha = 0.5)+
+  geom_vline(xintercept=0.20, color = "black", linetype= "dashed", show.legend = T)+
+  xlim(0,1)+
+  ggtitle("Missing Data Frequency Distribution")
+```
+
+
+Based on the density distribution we have selected the following threholds:
+
+- Minor Alelle Frequency (mAF) > 0.05, which means that the presence of the 
+less frequent alelle has to be at least 5% to be included in the filtered variants set
+
+- Missing Rate < 0.2, which means that we wont include the variants in which more than 20%
+of the data is not available.
+
+Keep in mind that the idea of this pipeline is to produce a very thinned SNP matrix,
+so very stringent parameters are apply at each step. Remember that the threholds 
+should be adapted to both your data and your goal.
+
+```{bash STP13_maffilter_summary.slurm, eval = F}
+#!/bin/bash
+#SBATCH --job-name=mafsummary
+#SBATCH --output=mafsummary_%j.log
+#SBATCH --error=mafsummary_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
+#SBATCH --time=02:00:00
+#SBATCH --mem=40G
+
+
+module load VCFtools/0.1.16-GCC-10.2.0
+
+#----------------------------------------------------------------------
+# Filter based on minor alelle frequency and study the missingnes proportion
+#----------------------------------------------------------------------
+
+echo "Starting to filter based on maf..."
+Results="/home/arondon/GATK2/Results"
+output="${Results}/variant_calling/snps/f2_bialellic_snps.vcf"
+output_bsnps="${Results}/variant_calling/snps/f1_bialellic_snps.vcf"
+
+# It might seem counter intuitive, but with max-missing = 0.8 we will be allowig just 20% of missing data 
+vcftools --vcf $output_bsnps --recode --maf 0.05 --max-missing 0.8 --out ${output}
+
+mv ${output}.recode.vcf Results/variant_calling/snps/f2_bialellic_snps.vcf
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# Return a summary of the number of variants per file
+#----------------------------------------------------------------------
+
+echo "Starting to create the summary table..."
+
+cd Results/variant_calling/snps
+
+for i in raw_snps.vcf f1_snps.vcf f1_bialellic_snps.vcf f2_bialellic_snps.vcf; do
+result=$(cat ${i} | grep -v '^#' | wc -l)
+result2=$(cat ${i} | grep -v '^#' | cut -f 1 | uniq -c | wc -l)
+printf "${i}\t${result}\t${result2}\n" >> /home/arondon/GATK2/Results/tables/resumen.table
+done
+
+echo "Process finished"
+```
+
+Here we can find a summary table in which we can get to see the variant count per 
+```{r}
+summary <- read.table("~/Desktop/files_RMD/resumen-3.table")
+colnames(summary) <- c("File", "Variants", "Chromosomes")
+summary[5,] <- c("pruned02","53807", "21")
+summary[6,] <- c("SNPs","3558119", "21")
+summary$Variants <- as.numeric(summary$Variants)
+summary$File <- c("Raw variants", "Hard-filtered SNPs", "HF Bialellic SNPs", "bSNPs filtered", "Pruned bSNPs", "Raw SNPs")
+summary$Variants <- c(4032321, 1850900, 1682128, 600096,53807, 3558119)
+summary
+```
+
+```{r, warning=FALSE}
+library(ggplot2)
+library(forcats)
+
+ggplot(summary, aes(x = fct_reorder(File, Variants, .desc = TRUE), y = Variants)) +
+  geom_segment(aes(xend = File, yend = 0), color = "grey") +  # Add segments
+  geom_point(color = "darkgreen", size = 6) +  
+  labs(x = NULL, y = NULL) +  # Customize axis labels
+  theme(
+    panel.background = element_blank(),
+    axis.text.x = element_text(size = 12),
+    panel.grid.major = element_line(color = "lightgrey", linetype = "solid", linewidth = 0.2)
+  ) +
+  scale_y_log10() +
+  coord_fixed(ratio = 0.5)
+```
+
+
+
+To proceed with the annotation we will have to change the names of the chromsomes in our annotation. 
+This is because we mapped to the reference genome from the NCBI while SNPeff use Enssembl chromosome annotation.
+The new chromosome's names can be found below and once that step is completed we can functional annotate the variants.
+
+NC_018218.1     1       
+NC_018217.1     2
+NC_018216.1     3
+NC_018215.1     4
+NC_018214.1     5
+NC_018213.1     6
+NC_018212.1     7
+NC_018211.1     8
+NC_018210.1     9
+NC_018209.1     10
+NC_018208.1     11
+NC_018207.1     12
+NC_018206.1     13
+NC_018205.1     14
+NC_018204.1     15
+NC_018203.1     16
+NC_018202.1     17
+NC_018201.1     18
+NC_018200.1     19
+NC_018199.1     20
+NC_018198.1     21
+
+
+```{bash STP14_snpEff.slurm, eval = F }
+#!/bin/bash
+#SBATCH --job-name=SNPeff
+#SBATCH --output=SNPeff_%j.log
+#SBATCH --error=SNPeff_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mem=40G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+dirsnpeff="/home/arondon/snpEff"
+Results="/home/arondon/GATK2/Results"
+Data="/home/arondon/GATK2/Data"
+list="${Data}/lists/renamechr.txt"
+
+mkdir -p $Results/snpeff
+snpeff="/home/arondon/snpEff/snpEff.jar"
+vcf="${Results}/snpeff/snps_toannotate.vcf"
+out="${Results}/snpeff/snps_annotated.vcf"
+
+module load Java/1.8.0_212
+module load GATK/4.1.2.0-GCCcore-8.2.0-Java-1.8 
+module load picard/2.26.10-Java-15
+module load BCFtools/1.9-GCC-8.2.0-2.31.1
+
+# Install and unzip SnpEff
+if [ ! -d ${dirsnpeff} ]; then
+    wget https://snpeff.blob.core.windows.net/versions/snpEff_latest_core.zip
+    unzip snpEff_latest_core.zip -d ${dirsnpeff}
+fi
+
+
+#----------------------------------------------------------------------
+# Renaming chromosomes
+#----------------------------------------------------------------------
+
+echo "Renaming chromosomes..."
+
+bcftools annotate --rename-chrs ${list} ${Results}/variant_calling/snps/f2_bialellic_snps.vcf > ${vcf}
+
+echo "Process finished"
+
+#----------------------------------------------------------------------
+# SNP annotation
+#----------------------------------------------------------------------
+
+echo "Annotating filtered snps..."
+
+java -Xmx32g -jar ${snpeff} download Zymoseptoria_tritici
+java -Xmx32g -jar ${snpeff} -v Zymoseptoria_tritici ${vcf} > $out
+
+echo "Process finished"
+```
+
+## SNP Prunning
+
+LD pruning algorithm uses the first SNP (in genome order) and computes the correlation with the following ones (e.g. windowsize =50). When it finds a large correlation, it removes one SNP from the correlated pair, keeping the one with the largest minor allele frequency (MAF), thus possibly removing the first SNP. Then it goes on with the next SNP (not yet removed). So, in some worst case scenario, this algorithm may in fact remove all SNPs of the genome (expect one).
+
+This can be easily done with the following PLINK command: 
+--indep-pairwise <window size>['kb'] <step size (variant ct)> <r^2 threshold>. But first, we should plot LD decay to choose the window size (where the correlation of the marers begins to drastically decrease), and also the distribution of the R2 values to select the threhold.
+
+So, first we will create the bed files for our annotated snps
+```{r, eval = F}
+# This will generate the .map and the .ped file, however we wil still lacking the .bed files
+module load VCFtools/0.1.16-GCC-10.2.0
+
+vcftools \
+--gzvcf Results/snpeff/snps_annotated.vcf \
+--plink \
+--out Results/plink/final_snps
+
+# NOw we will create the bed files
+module load PLINK/1.9b_6.21-x86_64
+
+plink \
+--file Results/plink/final_snps \
+--make-bed \
+--out Results/plink/final_snps
+```
+
+After that, we will generate two files, one containing the LD across all variants and the other containing a correlation matrix between each pair, for each of the 21 chromosomes of Zymoseptoria tritici using the following code:
+
+```{bash, eval = F}
+#!/bin/bash
+#SBATCH --job-name=LD
+#SBATCH --output=LD_%j.log
+#SBATCH --error=LD_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=02:00:00
+#SBATCH --mem=100G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+Results="/home/arondon/GATK2/Results"
+input="${Results}/plink/final_snps"
+
+module load PLINK/1.9b_6.21-x86_64
+module load R
+
+mkdir -p "${Results}/plink/LD/files"
+mkdir -p "${Results}/plink/LD/matrix"
+
+output_dir1="${Results}/plink/LD/files"
+output_dir2="${Results}/plink/LD/matrix"
+
+#----------------------------------------------------------------------
+# Create the file and matrix containing the LD information per chromosome
+#----------------------------------------------------------------------
+
+for i in {1..21}; do
+    if [ ! -f "${output_dir1}/LDfile_${i}.ld" ] || [ ! -f "${output_dir2}/LDmatrix_${i}.ld" ]; then
+        plink --bfile "${input}" \
+        --chr "${i}" \
+        --r2 \
+        --ld-window-r2 0 \
+        --ld-window 100 \
+        --ld-window-kb 100 \
+        --out "${output_dir1}/LDfile_${i}"
+        
+        plink \
+        --bfile "${input}" \
+        --chr "${i}" \
+        --r2 square \
+        --out "${output_dir2}/LDmatrix_${i}"
+    else
+        echo "Already existing files for chr ${i}."
+    fi
+done
+```
+
+Then we will plot the LD decay distribution
+
+```{bash LD_plots.slurm, eval = F}
+#!/bin/bash
+#SBATCH --job-name=LD_plots
+#SBATCH --output=_LD_plots_%j.log
+#SBATCH --error=LD_plots_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
+#SBATCH --time=02:00:00
+#SBATCH --mem=40G
+#SBATCH --array=1-21
+
+module load R
+
+srun Rscript /home/arondon/GATK2/Scripts/LDdensity_plots.R # or LDdecay_plot.R
+```
+
+The R code is this one:
+
+```{r LDdecay_plots.R, eval = F}
+library(ggplot2)
+library(reshape2)
+library(Cairo)
+library(dplyr)
+
+directory <- "/home/arondon/GATK2/Results/plink/LD/files/ld/"
+file_paths <- list.files(directory, pattern = "\\.ld$", full.names = TRUE)
+
+iter <- as.numeric(Sys.getenv("SLURM_ARRAY_TASK_ID"))
+
+file <- file_paths[iter]
+
+output_file <- paste0("/home/arondon/GATK2/Results/images/LDdecay_", basename(file), ".png")
+Cairo(600, 600, file = output_file, type = "png", bg = "white")
+
+ldvalues <- read.table(file, header = TRUE)
+LDdecay_values <- ldvalues %>%
+  mutate(Distance = abs(BP_B - BP_A) / 1000)
+
+ggplot(LDdecay_values) + 
+  geom_point(aes(x = Distance, y = R2)) +
+  geom_smooth(aes(x = Distance, y = R2), color = "red", size = 1) +
+  labs(title = paste("LD decay for", file), x = "Distance (kb)", y = "R2") +
+  theme(panel.background = element_blank())
+
+dev.off()
+```
+
+The results are shown below
+
+```{r, echo=FALSE, out.width = '100%',fig.align="center", fig.cap= "Figure X. LD decay"}
+knitr::include_graphics("/Users/alejandrodominguezrondon/Desktop/images/LDdecay.png")
+```
+
+So, based on the results obtained, we can select the threshold for R2. Also, based 
+on the average base distance at which the LD starts to decrease, we have selected a window size of 1000.
+
+To perform the pruning we will use  different thresholds: 0.1, 0.2, 0.3, 0.5, 0.7 and 0.9:
+
+```{bash STP15_pruning.slurm, eval = F}
+#!/bin/bash
+#SBATCH --job-name=pruning
+#SBATCH --output=pruning_%j.log
+#SBATCH --error=pruning_%j.err
+#SBATCH --partition=fast
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
+#SBATCH --time=02:00:00
+#SBATCH --mem=40G
+
+#----------------------------------------------------------------------
+# Define the variables and load the required modules
+#----------------------------------------------------------------------
+Results="/home/arondon/GATK2/Results"
+input="${Results}/plink/allsnps3/final_snps"
+
+module load PLINK/1.9b_6.21-x86_64
+
+#----------------------------------------------------------------------
+# Create the .bed .map .bim .fam and .ped files for each LD prunning threhsold
+#----------------------------------------------------------------------
+
+echo "Starting to create the files..."
+
+for i in 0.1 0.2 0.3 0.5 0.7 0.9; do
+        (
+	mkdir -p ${Results}/plink/r${i}
+
+        plink \
+        --noweb \
+        --file ${input} \
+        --indep-pairwise 1000 50 ${i} \
+        --out Results/plink/${i}
+
+        plink \
+        --file ${input} \
+        --extract Results/plink/${i}.prune.in \
+        --make-bed \
+        --out Results/plink/r${i}/pruned_snps
+
+        plink \
+        --bfile Results/plink/r${i}/pruned_snps \
+        --recode \
+        --out Results/plink/r${i}/pruned_snps) &
+done
+
+wait
+
+echo "Process finished"
+```
+
+The remaining variant set has decreased to around 80k SNPs, we can try to 
+take a look at the LD in each chromosome now that the pruning has been completed 
+to check that the correlation has decreased. It can be done running the code
+LD_plots.slurm to run the LDheatmap_plots3.R code, which can be found below
+
+```{r LDheatmap_plots3.R, eval = F}
+library(ggplot2)
+library(reshape2)
+library(Cairo)
+
+directory <- "/home/arondon/GATK2/Results/plink/LD2/r0.1/matrix/ld/"
+files <- list.files(directory, full.names = TRUE)
+
+process_matrix <- function(file) {
+  matrix_data <- read.table(file)
+  matrix_data <- as.matrix(matrix_data)
+  colnames(matrix_data) <- 1:ncol(matrix_data)
+  
+  get_upper_tri <- function(cormat) {
+    cormat[lower.tri(cormat)] <- NA
+    return(cormat)
+  }
+  
+  upper_tri <- get_upper_tri(matrix_data)
+  melted_cormat <- melt(upper_tri, na.rm = TRUE)
+  
+  return(melted_cormat)
+}
+
+iter <- as.numeric(Sys.getenv("SLURM_ARRAY_TASK_ID"))
+
+file_path <- files[iter]
+
+melted_cormat <- process_matrix(file_path)
+
+# Generate plot for each file
+output_file <- paste0("/home/arondon/GATK2/Results/images/LDheatmapr0.1/heatmap_", basename(file_path), ".png")
+Cairo(600, 600, file = output_file, type = "png", bg = "white")
+
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1, 1), space = "Lab", name = "Pearson\nCorrelation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1)) +
+  coord_fixed() +
+  labs(title = paste("LD correlation for", basename(file_path)), x = "Marker", y = "Marker")
+
+dev.off()
+```
+
+We can compare the LD heatmap in a chromosome before and after prunning
+just to show the effect of this step:
+
+
+```{r, echo=FALSE, out.width = '100%',fig.align="center", fig.cap= "Figure X. LD correlation in chromosme 17 before and after pruning"}
+p1 <- ggdraw() + draw_image("/Users/alejandrodominguezrondon/Desktop/images/LDchr18.png", scale = 0.9)
+p2 <- ggdraw() + draw_image("/Users/alejandrodominguezrondon/Desktop/images/LDchr18.2.png", scale = 0.9)
+
+plot_grid(p1, p2)
+```
+
+
+A summary of the remaining variants per file after the different threshold parameters can be found in here:
+
+
+Once that we obtain the pruned. files, we can download them to run the GWAS
+
+
+# EXTRAS
+
+We conducted the GWAS with several different pruning parameters. Now we will collect all 
+the results to try to find which results do they have in common. 
+
+
+
